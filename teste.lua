@@ -1,18 +1,6 @@
---[[==========================================================================
-  Teste de conexao de rede  --  Advanced Computer central
-  ---------------------------------------------------------------------------
-  Exercita as tres redes de uma vez:
-    1. WIRELESS (Ender Modem): ativa o no via rednet ("lasernode").
-    2. REDSTONE: apos 3s, aciona o Amplifier final (lado SIDE_FIRE).
-    3. CABO DE REDE: le o Fusion Reactor Logic Adapter e mostra no Monitor.
-
-  Enquanto roda, mantem um heartbeat "on" pro no (o receptor desliga sozinho
-  se ficar 3s sem sinal). Pare com Ctrl+T -> ao sair, desliga tudo.
-============================================================================]]
-
 ------------------------------------------------------------------ CONFIG
 local PROTOCOL  = "lasernode"  -- mesmo canal do node_receiver.lua
-local SIDE_FIRE = "right"      -- lado do computador -> redstone do Amplifier final
+local SIDE_FIRE = "left"      -- lado do computador -> redstone do Amplifier final
 local NODE_WAIT = 3            -- s entre ativar o no e ativar o Amplifier
 local REFRESH   = 1            -- s entre atualizacoes do monitor
 
