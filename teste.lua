@@ -1,11 +1,23 @@
+--[[==========================================================================
+  Teste de conexao de rede  --  Advanced Computer central (remoto)
+  ---------------------------------------------------------------------------
+  Exercita as tres redes de uma vez:
+    1. WIRELESS (Ender Modem): ativa o no via rednet ("lasernode").
+    2. RELAY (cabo): apos 3s, dispara o Amplifier final pelo redstone_relay.
+    3. CABO: le o Fusion Reactor Logic Adapter e mostra no Monitor.
+
+  So existe UM redstone_relay na rede (o de disparo), entao
+  peripheral.find("redstone_relay") ja o identifica.
+  Mantem heartbeat "on" pro no enquanto roda. Ctrl+T -> desliga tudo ao sair.
+============================================================================]]
+
 ------------------------------------------------------------------ CONFIG
 local PROTOCOL  = "lasernode"  -- mesmo canal do node_receiver.lua
-local SIDE_FIRE = "left"      -- lado do computador -> redstone do Amplifier final
-local NODE_WAIT = 3            -- s entre ativar o no e ativar o Amplifier
+local FIRE_SIDE = "bottom"     -- face do Redstone Relay que toca o Amplifier final
+local NODE_WAIT = 3            -- s entre ativar o no e disparar o Amplifier
 local REFRESH   = 1            -- s entre atualizacoes do monitor
 
 ------------------------------------------------------------------ HELPERS
--- chamada protegida a metodo de periferico (retorna nil em erro)
 local function safe(obj, method, ...)
   if not obj then return nil end
   local fn = obj[method]
@@ -15,16 +27,21 @@ local function safe(obj, method, ...)
   return nil
 end
 
-local function mk(k)  -- Kelvin -> MegaKelvin legivel
-  return string.format("%.2f MK", (tonumber(k) or 0) / 1e6)
-end
+local function mk(k) return string.format("%.2f MK", (tonumber(k) or 0) / 1e6) end
 
-local function sep(n) -- separador de milhar (1234567 -> 1.234.567)
+local function sep(n)
   local s = tostring(math.floor(tonumber(n) or 0))
   local c
   repeat s, c = s:gsub("^(-?%d+)(%d%d%d)", "%1.%2") until c == 0
   return s
 end
+
+------------------------------------------------------------------ PERIFERICOS
+local reactor   = peripheral.find("fusionReactorLogicAdapter")
+local amplifier = peripheral.find("laserAmplifier")
+local fireRelay = peripheral.find("redstone_relay")  -- unico relay na rede = o de disparo
+local mon       = peripheral.find("monitor")
+local out       = mon or term   -- Monitor e term compartilham a mesma API
 
 local function tankAmt(getter)
   local t = safe(reactor, getter)
@@ -32,13 +49,7 @@ local function tankAmt(getter)
   return tonumber(t) or 0
 end
 
------------------------------------------------------------------- PERIFERICOS
-local reactor   = peripheral.find("fusionReactorLogicAdapter")
-local amplifier = peripheral.find("laserAmplifier")
-local mon       = peripheral.find("monitor")
-local out       = mon or term   -- Monitor e term compartilham a mesma API
-
--- abre o primeiro modem SEM FIO que encontrar (Ender/Wireless)
+-- abre o primeiro modem SEM FIO (Ender/Wireless) que encontrar
 local modemSide
 for _, side in ipairs(redstone.getSides()) do
   if peripheral.getType(side) == "modem" and peripheral.call(side, "isWireless") then
@@ -50,9 +61,10 @@ end
 term.clear(); term.setCursorPos(1, 1)
 print("== Teste de conexao ==")
 print(modemSide and ("Ender Modem: OK ("..modemSide..")") or "Ender Modem: NAO ENCONTRADO")
-print(reactor   and "Reactor adapter: OK"   or "Reactor adapter: NAO ENCONTRADO")
-print(amplifier and "Amplifier final: OK"   or "Amplifier final: NAO ENCONTRADO (so leitura)")
-print(mon       and "Monitor: OK"           or "Monitor: NAO ENCONTRADO (usando o terminal)")
+print(reactor   and "Reactor adapter: OK" or "Reactor adapter: NAO ENCONTRADO")
+print(amplifier and "Amplifier final: OK" or "Amplifier final: NAO ENCONTRADO (so leitura)")
+print(fireRelay and "Redstone Relay: OK"  or "Redstone Relay: NAO ENCONTRADO (sem disparo)")
+print(mon       and "Monitor: OK"         or "Monitor: NAO ENCONTRADO (usando terminal)")
 print("")
 
 if not modemSide then
@@ -95,7 +107,7 @@ local function drawReactor(nodeOn, ampOn)
 
   label(16, "No (rednet):",  nodeOn and "ATIVADO" or "desligado",
         nodeOn and colours.lime or colours.grey)
-  label(17, "Amplifier RS:", ampOn and "ON" or "off",
+  label(17, "Relay disparo:", ampOn and "ON" or "off",
         ampOn and colours.lime or colours.grey)
   out.setTextColour(colours.white)
 end
@@ -107,16 +119,21 @@ local function runTest()
   for _ = 1, NODE_WAIT do rednet.broadcast(true, PROTOCOL); sleep(1) end
   print("ok (verifique se a fonte do no ligou)")
 
-  -- 2) ativa o Amplifier final por redstone
-  write("Ativando o Amplifier final (redstone "..SIDE_FIRE..")... ")
-  redstone.setOutput(SIDE_FIRE, true)
-  print("ok")
+  -- 2) dispara o Amplifier final pelo relay
+  if fireRelay then
+    write("Disparando o Amplifier final (relay, face "..FIRE_SIDE..")... ")
+    fireRelay.setOutput(FIRE_SIDE, true)
+    print("ok")
+  else
+    print("[pulando disparo: Redstone Relay ausente]")
+  end
 
   -- 3) leitura continua do reator no monitor (mantendo o no vivo)
   print("Mostrando dados do reator. Ctrl+T para parar.")
   while true do
-    rednet.broadcast(true, PROTOCOL)          -- heartbeat: mantem o no ligado
-    drawReactor(true, redstone.getOutput(SIDE_FIRE))
+    rednet.broadcast(true, PROTOCOL)   -- heartbeat: mantem o no ligado
+    local ampOn = fireRelay ~= nil and fireRelay.getOutput(FIRE_SIDE) or false
+    drawReactor(true, ampOn)
     sleep(REFRESH)
   end
 end
@@ -124,9 +141,9 @@ end
 ------------------------------------------------------------------ EXECUCAO + LIMPEZA
 local ok, err = pcall(runTest)
 
--- ao sair (inclusive por Ctrl+T): desliga tudo
+-- ao sair (inclusive Ctrl+T): desliga tudo
 rednet.broadcast(false, PROTOCOL)
-redstone.setOutput(SIDE_FIRE, false)
+if fireRelay then fireRelay.setOutput(FIRE_SIDE, false) end
 if mon then mon.setBackgroundColour(colours.black); mon.clear() end
-print("\nTeste encerrado. No e Amplifier desligados.")
+print("\nTeste encerrado. No e disparo desligados.")
 if not ok and err ~= "Terminated" then printError(err) end
