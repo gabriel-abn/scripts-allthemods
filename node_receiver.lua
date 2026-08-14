@@ -1,4 +1,4 @@
---[[==========================================================================
+[[==========================================================================
   Laser Node Receiver  --  CC:Tweaked
   ---------------------------------------------------------------------------
   Roda em CADA computador de Laser Node. Escuta o "canal" (protocol) do
@@ -13,8 +13,8 @@
       array de lasers preso em ON sem supervisão.
 ============================================================================]]
 
-local MODEM_SIDE = "back"       -- lado do computador com o modem (Ender/Wireless)
-local OUT_SIDE   = "bottom"     -- lado que aciona a fonte de energia do Node
+local MODEM_SIDE = "top"       -- lado do computador com o modem (Ender/Wireless)
+local OUT_SIDE   = "back"     -- lado que aciona a fonte de energia do Node
 local PROTOCOL   = "lasernode"  -- "SSID" da rede: TODOS os Nodes usam o mesmo
 local TIMEOUT    = 3            -- s sem mensagem -> estado seguro (OFF)
 
