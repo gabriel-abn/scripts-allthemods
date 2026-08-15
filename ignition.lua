@@ -1,37 +1,27 @@
 --[[==========================================================================
   Fusion Reactor Ignition Controller  --  Mekanism 10 + CC:Tweaked 1.120
   ---------------------------------------------------------------------------
-  Fluxo:
-   1. Loop continuo.
-   2. Validacoes de partida (uma vez); se falhar, TRAVA e mostra o erro no monitor:
-        - 8 Laser Nodes respondem (discovery ping/pong)
-        - Amplifier final + Redstone Relay presentes
-        - Reator presente e formado
-   3. Ativa todos os Nodes (carga).
-   4. Nodes ficam ativos ate o Amplifier final encher.
-   5. Cheio -> dispara SOMENTE se:
-        - D-T Fuel suficiente no reator
-        - Hohlraum com D-T (via hasHohlraum se existir; senao coberto por canIgnite)
-        - canIgnite() == true
-   6. Monitor sempre mostra o status atual do processo.
-
-  Redes: CABO (reator, amplifier, relay, monitor) + WIRELESS (nos, rednet).
+  Condicoes de disparo (passo 5) mapeadas aos metodos REAIS da build:
+    5.1 Hohlraum: getHohlraum() -> count>0, name "mekanismgenerators:hohlraum",
+                  e components contendo "fusion_fuel"
+    5.2 D-T Fuel: getDTFuelFilledPercentage() >= MIN_DT_FILL
+    5.3 ignicao : nao ha canIgnite; garantido por burning()==false (loop) + amplifier cheio
 ============================================================================]]
 
 ------------------------------------------------------------------ CONFIG
-local PROTOCOL       = "lasernode"  -- canal rednet dos nos
-local FIRE_SIDE      = "bottom"     -- face do Redstone Relay que toca o Amplifier
-local EXPECTED_NODES = 8            -- quantos Laser Nodes devem responder
-local DISCOVER_WIN   = 2            -- s de janela do discovery
+local PROTOCOL       = "lasernode"
+local FIRE_SIDE      = "bottom"
+local EXPECTED_NODES = 8
+local DISCOVER_WIN   = 2
 
-local TARGET_FILL    = 0.99   -- carga (0-1) do amplifier p/ considerar "cheio"
-local MIN_DT_FILL    = 0.10   -- fracao minima do tanque de D-T Fuel p/ disparar
-local FIRE_PULSE     = 0.4    -- s do pulso de disparo
-local POST_FIRE      = 2.0    -- s de espera apos disparo p/ o plasma atualizar
-local POLL_INTERVAL  = 0.5    -- s entre amostragens ao carregar (< failsafe do no)
-local IDLE_INTERVAL  = 2      -- s entre atualizacoes quando ocioso/aguardando
-local INJECTION_RATE = 0      -- >0 forca setInjectionRate; 0 = nao mexer (voce controla)
-local IGNITION_FALLBACK = 1e8 -- 100 MK, caso nao leia o alvo do reator
+local TARGET_FILL    = 0.99   -- carga (0-1) do amplifier p/ "cheio"
+local MIN_DT_FILL    = 0.10   -- fracao minima do tanque interno de D-T Fuel
+local FIRE_PULSE     = 0.4
+local POST_FIRE      = 2.0
+local POLL_INTERVAL  = 0.5
+local IDLE_INTERVAL  = 2
+local INJECTION_RATE = 0      -- >0 forca setInjectionRate; 0 = nao mexer
+local IGNITION_FALLBACK = 1e8
 
 ------------------------------------------------------------------ PERIFERICOS
 local reactor   = peripheral.find("fusionReactorLogicAdapter")
@@ -71,11 +61,23 @@ local function plasmaTemp()     return tonumber(safe(reactor,"getPlasmaTemperatu
 local function fill()           return tonumber(safe(amplifier,"getEnergyFilledPercentage")) or 0 end
 local function isFormed()       return safe(reactor,"isFormed") == true end
 
+-- D-T Fuel: usa getDTFuelFilledPercentage (0-1); fallback amount/capacity
 local function dtFill()
+  local p = tonumber(safe(reactor, "getDTFuelFilledPercentage"))
+  if p then return p end
   local t = safe(reactor,"getDTFuel"); local amt = (type(t)=="table" and tonumber(t.amount)) or 0
   local cap = tonumber(safe(reactor,"getDTFuelCapacity")) or 0
-  if cap <= 0 then return 0 end
-  return amt / cap
+  return cap > 0 and amt/cap or 0
+end
+
+-- Hohlraum: retorna present(bool|nil), withDT(bool)
+local function hohlraum()
+  local h = safe(reactor, "getHohlraum")
+  if type(h) ~= "table" then return nil, false end   -- metodo ausente -> desconhecido
+  local present = (tonumber(h.count) or 0) > 0 and h.name == "mekanismgenerators:hohlraum"
+  local withDT  = present and type(h.components) == "string"
+                  and h.components:find("fusion_fuel") ~= nil
+  return present, withDT
 end
 
 local function burning()
@@ -107,8 +109,11 @@ local function drawState(status, col)
     label(10, "Ignicao alvo:", mk(ignitionTarget()))
     label(11, "D-T Fuel:",     string.format("%.0f %%", dtFill() * 100))
     label(12, "Injecao:",      tostring(safe(reactor,"getInjectionRate") or "-"))
-    label(13, "canIgnite:",    tostring(safe(reactor,"canIgnite")))
-    label(14, "Producao:",     sep(safe(reactor,"getProductionRate")).." FE/t")
+    local present, withDT = hohlraum()
+    local hstr = present == nil and "n/d"
+              or (present and (withDT and "com D-T" or "sem D-T") or "ausente")
+    label(13, "Hohlraum:", hstr, (present and withDT) and colours.lime or colours.orange)
+    label(14, "Producao:", sep(safe(reactor,"getProductionRate")).." FE/t")
   end
   out.setTextColour(colours.white)
 end
@@ -155,7 +160,7 @@ local function validate()
 end
 
 ------------------------------------------------------------------ ACOES
-local function chargeBroadcast(on) rednet.broadcast({ cmd = "charge", on = true }, PROTOCOL) end
+local function chargeBroadcast(on) rednet.broadcast({ cmd = "charge", on = on }, PROTOCOL) end
 
 local function fire()
   fireRelay.setOutput(FIRE_SIDE, true)
@@ -163,11 +168,12 @@ local function fire()
   fireRelay.setOutput(FIRE_SIDE, false)
 end
 
--- condicoes do passo 5: retorna (ok, motivo_faltante)
+-- condicoes do passo 5 (metodos reais da build)
 local function fireConditions()
   if dtFill() < MIN_DT_FILL then return false, "Aguardando combustivel D-T" end
-  if safe(reactor, "hasHohlraum") == false then return false, "Aguardando Hohlraum com D-T" end
-  if safe(reactor, "canIgnite") ~= true then return false, "Aguardando condicoes (canIgnite)" end
+  local present, withDT = hohlraum()
+  if present == false then return false, "Aguardando Hohlraum" end
+  if present == true and not withDT then return false, "Hohlraum sem D-T Fuel" end
   return true, nil
 end
 
@@ -179,9 +185,8 @@ if mon then mon.setTextScale(1) end
 
 local fault = validate()
 if fault then
-  showFault(fault)
-  printError("[FALHA] "..fault)
-  return   -- trava: monitor fica mostrando o problema
+  showFault(fault); printError("[FALHA] "..fault)
+  return
 end
 
 ------------------------------------------------------------------ LOOP PRINCIPAL
@@ -195,13 +200,13 @@ local ok, err = pcall(function()
     else
       -- passo 3-4: carrega ate o Amplifier final encher
       while fill() < TARGET_FILL and not burning() do
-        chargeBroadcast(true)   -- heartbeat mantem os nos ligados
+        chargeBroadcast(true)
         drawState(string.format("Carregando amplificador (%.0f%%)", fill() * 100), colours.cyan)
         sleep(POLL_INTERVAL)
       end
-      chargeBroadcast(false)    -- amplifier cheio: para de carregar, carga fica travada
+      chargeBroadcast(false)
 
-      -- passo 5: so dispara quando todas as condicoes baterem
+      -- passo 5: dispara so quando todas as condicoes baterem
       if not burning() then
         local ready, reason = fireConditions()
         while not ready and not burning() do
@@ -213,11 +218,8 @@ local ok, err = pcall(function()
           drawState("Disparando laser...", colours.yellow)
           fire()
           sleep(POST_FIRE)
-          if burning() then
-            drawState("Ignicao bem-sucedida!", colours.lime)
-          else
-            drawState("Nao ignitou - repetindo ciclo", colours.orange)
-          end
+          drawState(burning() and "Ignicao bem-sucedida!" or "Nao ignitou - repetindo ciclo",
+                    burning() and colours.lime or colours.orange)
           sleep(1)
         end
       end
@@ -229,8 +231,7 @@ end)
 chargeBroadcast(false)
 if fireRelay then fireRelay.setOutput(FIRE_SIDE, false) end
 if not ok and err ~= "Terminated" then
-  showFault("Erro em execucao: "..tostring(err))
-  printError(err)
+  showFault("Erro em execucao: "..tostring(err)); printError(err)
 else
   drawState("Encerrado.", colours.grey)
 end
