@@ -155,7 +155,7 @@ local function validate()
 end
 
 ------------------------------------------------------------------ ACOES
-local function chargeBroadcast(on) rednet.broadcast({ cmd = "charge", on = on }, PROTOCOL) end
+local function chargeBroadcast(on) rednet.broadcast({ cmd = "charge", on = true }, PROTOCOL) end
 
 local function fire()
   fireRelay.setOutput(FIRE_SIDE, true)
