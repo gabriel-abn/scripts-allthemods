@@ -81,6 +81,9 @@ local function hohlraum()
 end
 
 local function burning()
+  local ig = safe(reactor, "isIgnited")
+  if ig ~= nil then return ig == true end
+  -- fallback caso a build nao tenha isIgnited
   if (tonumber(safe(reactor,"getProductionRate")) or 0) > 0 then return true end
   return plasmaTemp() >= ignitionTarget()
 end
