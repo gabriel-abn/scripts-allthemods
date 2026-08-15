@@ -1,41 +1,45 @@
 --[[==========================================================================
-  Fusion Reactor Ignition Controller  --  HIBRIDO (relay + rednet)
-    Mekanism 10 + CC:Tweaked 1.120
+  Fusion Reactor Ignition Controller  --  Mekanism 10 + CC:Tweaked 1.120
   ---------------------------------------------------------------------------
-  Computador REMOTO. Duas redes:
-    CABO   : fusionReactorLogicAdapter (le temp/fuel)
-             laserAmplifier final       (le carga %)
-             redstone_relay             (DISPARA o Amplifier final)
-             monitor (opcional)
-    WIRELESS (Ender Modem, rednet "lasernode"):
-             ativa a fonte de energia de cada Laser Node
-             (cada no roda node_receiver.lua, com failsafe de 3s)
+  Fluxo:
+   1. Loop continuo.
+   2. Validacoes de partida (uma vez); se falhar, TRAVA e mostra o erro no monitor:
+        - 8 Laser Nodes respondem (discovery ping/pong)
+        - Amplifier final + Redstone Relay presentes
+        - Reator presente e formado
+   3. Ativa todos os Nodes (carga).
+   4. Nodes ficam ativos ate o Amplifier final encher.
+   5. Cheio -> dispara SOMENTE se:
+        - D-T Fuel suficiente no reator
+        - Hohlraum com D-T (via hasHohlraum se existir; senao coberto por canIgnite)
+        - canIgnite() == true
+   6. Monitor sempre mostra o status atual do processo.
 
-  So existe UM redstone_relay na rede (o de disparo), entao
-  peripheral.find("redstone_relay") ja o identifica - sem nome fixo.
-  Pare com Ctrl+T -> ao sair, desliga carga (broadcast off) e disparo.
+  Redes: CABO (reator, amplifier, relay, monitor) + WIRELESS (nos, rednet).
 ============================================================================]]
 
 ------------------------------------------------------------------ CONFIG
-local PROTOCOL   = "lasernode"  -- mesmo canal do node_receiver.lua
-local FIRE_SIDE  = "bottom"     -- face do relay que toca o Amplifier final
+local PROTOCOL       = "lasernode"  -- canal rednet dos nos
+local FIRE_SIDE      = "bottom"     -- face do Redstone Relay que toca o Amplifier
+local EXPECTED_NODES = 8            -- quantos Laser Nodes devem responder
+local DISCOVER_WIN   = 2            -- s de janela do discovery
 
-local TARGET_FILL    = 0.99   -- carga do amplifier (0-1) p/ considerar "cheio"
-local CHARGE_TIMEOUT = 30     -- s max. esperando encher antes de disparar assim mesmo
-local FIRE_PULSE     = 0.4    -- s de duracao do pulso de disparo
-local SETTLE_TIME    = 0.5    -- s de pausa apos parar de carregar, antes de disparar
+local TARGET_FILL    = 0.99   -- carga (0-1) do amplifier p/ considerar "cheio"
+local MIN_DT_FILL    = 0.10   -- fracao minima do tanque de D-T Fuel p/ disparar
+local FIRE_PULSE     = 0.4    -- s do pulso de disparo
 local POST_FIRE      = 2.0    -- s de espera apos disparo p/ o plasma atualizar
-local POLL_INTERVAL  = 0.5    -- s entre amostragens (< failsafe de 3s do no)
-local IDLE_INTERVAL  = 5      -- s entre checagens quando ocioso / ignitado
-local INJECTION_RATE = 2      -- mB/t de D-T (0 = nao mexer). Multiplos de 2.
+local POLL_INTERVAL  = 0.5    -- s entre amostragens ao carregar (< failsafe do no)
+local IDLE_INTERVAL  = 2      -- s entre atualizacoes quando ocioso/aguardando
+local INJECTION_RATE = 0      -- >0 forca setInjectionRate; 0 = nao mexer (voce controla)
 local IGNITION_FALLBACK = 1e8 -- 100 MK, caso nao leia o alvo do reator
 
 ------------------------------------------------------------------ PERIFERICOS
 local reactor   = peripheral.find("fusionReactorLogicAdapter")
 local amplifier = peripheral.find("laserAmplifier")
-local fireRelay = peripheral.find("redstone_relay")   -- unico relay na rede
+local fireRelay = peripheral.find("redstone_relay")
+local mon       = peripheral.find("monitor")
+local out       = mon or term
 
--- abre o primeiro modem SEM FIO (Ender/Wireless) que encontrar
 local modemSide
 for _, side in ipairs(redstone.getSides()) do
   if peripheral.getType(side) == "modem" and peripheral.call(side, "isWireless") then
@@ -43,11 +47,7 @@ for _, side in ipairs(redstone.getSides()) do
   end
 end
 
-local function fatal(m) printError("[ERRO] "..m); error(m, 0) end
-if not reactor   then fatal("Reactor Logic Adapter nao encontrado na rede.") end
-if not amplifier then fatal("Laser Amplifier final nao encontrado na rede.") end
-if not fireRelay then fatal("Redstone Relay de disparo nao encontrado na rede.") end
-if not modemSide then fatal("Ender Modem (sem fio) nao encontrado - carga dos nos indisponivel.") end
+local NODES_ONLINE = 0
 
 ------------------------------------------------------------------ HELPERS
 local function safe(obj, method, ...)
@@ -59,88 +59,178 @@ local function safe(obj, method, ...)
   return nil
 end
 
-local function ignitionTarget()
-  return tonumber(safe(reactor, "getIgnitionTemperature", false)) or IGNITION_FALLBACK
-end
-local function plasmaTemp() return tonumber(safe(reactor, "getPlasmaTemperature")) or 0 end
-local function fill()       return tonumber(safe(amplifier, "getEnergyFilledPercentage")) or 0 end
-local function isFormed()   return safe(reactor, "isFormed") == true end
-local function isIgnited()  return plasmaTemp() >= ignitionTarget() end
-
-local function hasFuel()
-  local ci = safe(reactor, "canIgnite")
-  if ci ~= nil then return ci end
-  local d  = safe(reactor, "getDeuterium"); d  = (d  and d.amount)  or 0
-  local t  = safe(reactor, "getTritium");   t  = (t  and t.amount)  or 0
-  local dt = safe(reactor, "getDTFuel");    dt = (dt and dt.amount) or 0
-  return (dt > 0) or (d > 0 and t > 0)
+local function mk(k) return string.format("%.2f MK", (tonumber(k) or 0) / 1e6) end
+local function sep(n)
+  local s = tostring(math.floor(tonumber(n) or 0)); local c
+  repeat s, c = s:gsub("^(-?%d+)(%d%d%d)", "%1.%2") until c == 0
+  return s
 end
 
--- carga: broadcast do estado desejado pros nos (idempotente + heartbeat)
-local function chargeBroadcast(on) rednet.broadcast(on, PROTOCOL) end
+local function ignitionTarget() return tonumber(safe(reactor,"getIgnitionTemperature", false)) or IGNITION_FALLBACK end
+local function plasmaTemp()     return tonumber(safe(reactor,"getPlasmaTemperature")) or 0 end
+local function fill()           return tonumber(safe(amplifier,"getEnergyFilledPercentage")) or 0 end
+local function isFormed()       return safe(reactor,"isFormed") == true end
 
--- disparo: pulsa o relay -> Amplifier final dispara
+local function dtFill()
+  local t = safe(reactor,"getDTFuel"); local amt = (type(t)=="table" and tonumber(t.amount)) or 0
+  local cap = tonumber(safe(reactor,"getDTFuelCapacity")) or 0
+  if cap <= 0 then return 0 end
+  return amt / cap
+end
+
+local function burning()
+  if (tonumber(safe(reactor,"getProductionRate")) or 0) > 0 then return true end
+  return plasmaTemp() >= ignitionTarget()
+end
+
+------------------------------------------------------------------ MONITOR
+local function label(y, name, value, col)
+  out.setCursorPos(1, y);  out.setTextColour(colours.lightGrey); out.write(name)
+  out.setCursorPos(16, y); out.setTextColour(col or colours.white); out.write(tostring(value))
+end
+
+local function drawState(status, col)
+  out.setBackgroundColour(colours.black); out.clear()
+  out.setCursorPos(1, 1); out.setTextColour(colours.cyan); out.write("FUSION REACTOR - IGNICAO")
+
+  out.setCursorPos(1, 3); out.setTextColour(colours.lightGrey); out.write("STATUS:")
+  out.setCursorPos(9, 3); out.setTextColour(col or colours.white); out.write(status)
+
+  label(5, "Nos online:", NODES_ONLINE.."/"..EXPECTED_NODES,
+        NODES_ONLINE >= EXPECTED_NODES and colours.lime or colours.orange)
+  label(6, "Amplifier:",  string.format("%.1f %%", fill() * 100))
+
+  local formed = isFormed()
+  label(8, "Reator:", formed and "formado" or "NAO formado", formed and colours.lime or colours.red)
+  if formed then
+    label(9,  "Plasma:",       mk(plasmaTemp()))
+    label(10, "Ignicao alvo:", mk(ignitionTarget()))
+    label(11, "D-T Fuel:",     string.format("%.0f %%", dtFill() * 100))
+    label(12, "Injecao:",      tostring(safe(reactor,"getInjectionRate") or "-"))
+    label(13, "canIgnite:",    tostring(safe(reactor,"canIgnite")))
+    label(14, "Producao:",     sep(safe(reactor,"getProductionRate")).." FE/t")
+  end
+  out.setTextColour(colours.white)
+end
+
+local function showFault(msg)
+  out.setBackgroundColour(colours.black); out.clear()
+  out.setCursorPos(1, 1); out.setTextColour(colours.red);  out.write("FALHA NA VALIDACAO")
+  out.setCursorPos(1, 3); out.setTextColour(colours.white); out.write(msg)
+  out.setCursorPos(1, 5); out.setTextColour(colours.grey)
+  out.write("Programa travado. Corrija e reinicie (Ctrl+R).")
+  out.setTextColour(colours.white)
+end
+
+------------------------------------------------------------------ DISCOVERY + VALIDACAO
+local function discoverNodes()
+  if not modemSide then return 0 end
+  rednet.broadcast({ cmd = "ping" }, PROTOCOL)
+  local seen, n = {}, 0
+  local timer = os.startTimer(DISCOVER_WIN)
+  while true do
+    local ev, a, b, c = os.pullEvent()
+    if ev == "rednet_message" and c == PROTOCOL and type(b) == "table"
+       and b.cmd == "pong" and not seen[a] then
+      seen[a] = true; n = n + 1
+    elseif ev == "timer" and a == timer then
+      break
+    end
+  end
+  return n
+end
+
+local function validate()
+  if not modemSide then return "Ender Modem ausente (rede dos nos)" end
+  if not reactor   then return "Reactor Logic Adapter ausente" end
+  if not isFormed()then return "Reator nao formado" end
+  if not amplifier then return "Laser Amplifier final ausente" end
+  if not fireRelay then return "Redstone Relay de disparo ausente" end
+  drawState("Procurando Laser Nodes...", colours.cyan)
+  NODES_ONLINE = discoverNodes()
+  if NODES_ONLINE < EXPECTED_NODES then
+    return string.format("Nos: so %d de %d responderam", NODES_ONLINE, EXPECTED_NODES)
+  end
+  return nil
+end
+
+------------------------------------------------------------------ ACOES
+local function chargeBroadcast(on) rednet.broadcast({ cmd = "charge", on = on }, PROTOCOL) end
+
 local function fire()
   fireRelay.setOutput(FIRE_SIDE, true)
   sleep(FIRE_PULSE)
   fireRelay.setOutput(FIRE_SIDE, false)
 end
 
------------------------------------------------------------------- SEQUENCIA DE IGNICAO
-local function chargeAndFire()
-  print("-> Carregando os nos via rednet...")
-
-  local t0 = os.clock()
-  while true do
-    chargeBroadcast(true)              -- heartbeat: mantem os nos ligados (<3s)
-    local f = fill()
-    local elapsed = os.clock() - t0
-    print(string.format("   amplifier: %5.1f%%   (%.0fs)", f * 100, elapsed))
-    if f >= TARGET_FILL then print("   amplifier cheio."); break end
-    if elapsed >= CHARGE_TIMEOUT then print("   timeout - disparando assim mesmo."); break end
-    sleep(POLL_INTERVAL)
-  end
-
-  chargeBroadcast(false)               -- desliga os nos
-  sleep(SETTLE_TIME)
-  print("-> Disparando o Amplifier final no reator...")
-  fire()
-  sleep(POST_FIRE)
+-- condicoes do passo 5: retorna (ok, motivo_faltante)
+local function fireConditions()
+  if dtFill() < MIN_DT_FILL then return false, "Aguardando combustivel D-T" end
+  if safe(reactor, "hasHohlraum") == false then return false, "Aguardando Hohlraum com D-T" end
+  if safe(reactor, "canIgnite") ~= true then return false, "Aguardando condicoes (canIgnite)" end
+  return true, nil
 end
 
------------------------------------------------------------------- SETUP + LOOP
+------------------------------------------------------------------ PARTIDA
 chargeBroadcast(false)
-fireRelay.setOutput(FIRE_SIDE, false)
+if fireRelay then fireRelay.setOutput(FIRE_SIDE, false) end
 if INJECTION_RATE > 0 then safe(reactor, "setInjectionRate", INJECTION_RATE) end
+if mon then mon.setTextScale(1) end
 
-print("Controlador hibrido iniciado (modem: "..modemSide..").")
-print(string.format("Alvo de ignicao: %.3e K", ignitionTarget()))
+local fault = validate()
+if fault then
+  showFault(fault)
+  printError("[FALHA] "..fault)
+  return   -- trava: monitor fica mostrando o problema
+end
 
+------------------------------------------------------------------ LOOP PRINCIPAL
 local ok, err = pcall(function()
   while true do
-    if not isFormed() then
-      print("[AVISO] Reator nao formado. Aguardando...")
-      sleep(IDLE_INTERVAL)
-
-    elseif isIgnited() then
-      print(string.format("IGNITADO. Plasma: %.3e K | Producao: %s FE/t",
-            plasmaTemp(), tostring(safe(reactor, "getProductionRate"))))
-      sleep(IDLE_INTERVAL)
-
-    elseif not hasFuel() then
-      print("[AVISO] Sem combustivel D-T suficiente. Aguardando...")
+    if burning() then
+      chargeBroadcast(false)
+      drawState("Reator ignitado (estavel)", colours.lime)
       sleep(IDLE_INTERVAL)
 
     else
-      print(string.format("Plasma abaixo do alvo (%.3e K). Ciclo de ignicao.", plasmaTemp()))
-      chargeAndFire()
-      print(isIgnited() and "[OK] Ignicao bem-sucedida!" or "[..] Ainda nao ignitou. Repetindo.")
+      -- passo 3-4: carrega ate o Amplifier final encher
+      while fill() < TARGET_FILL and not burning() do
+        chargeBroadcast(true)   -- heartbeat mantem os nos ligados
+        drawState(string.format("Carregando amplificador (%.0f%%)", fill() * 100), colours.cyan)
+        sleep(POLL_INTERVAL)
+      end
+      chargeBroadcast(false)    -- amplifier cheio: para de carregar, carga fica travada
+
+      -- passo 5: so dispara quando todas as condicoes baterem
+      if not burning() then
+        local ready, reason = fireConditions()
+        while not ready and not burning() do
+          drawState(reason, colours.orange)
+          sleep(IDLE_INTERVAL)
+          ready, reason = fireConditions()
+        end
+        if ready and not burning() then
+          drawState("Disparando laser...", colours.yellow)
+          fire()
+          sleep(POST_FIRE)
+          if burning() then
+            drawState("Ignicao bem-sucedida!", colours.lime)
+          else
+            drawState("Nao ignitou - repetindo ciclo", colours.orange)
+          end
+          sleep(1)
+        end
+      end
     end
   end
 end)
 
--- limpeza ao sair (inclusive Ctrl+T)
+------------------------------------------------------------------ LIMPEZA
 chargeBroadcast(false)
-fireRelay.setOutput(FIRE_SIDE, false)
-print("\nEncerrado. Carga (rednet) e disparo (relay) desligados.")
-if not ok and err ~= "Terminated" then printError(err) end
+if fireRelay then fireRelay.setOutput(FIRE_SIDE, false) end
+if not ok and err ~= "Terminated" then
+  showFault("Erro em execucao: "..tostring(err))
+  printError(err)
+else
+  drawState("Encerrado.", colours.grey)
+end
